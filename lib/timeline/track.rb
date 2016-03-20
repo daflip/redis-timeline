@@ -21,27 +21,48 @@ module Timeline::Track
     end
 
     private
+
       def define_activity_method(method_name, options={})
         define_method method_name do
-          @actor = send(options[:actor])
+          redis_proof do
           @fields_for = {}
           @object = set_object(options[:object])
+          if options[:actor] == :self
+            @actor = @object
+          else
+            @actor = send(options[:actor])
+          end
+          unless @actor
+            logger.error "bad actor aborting timeline track for #{self.inspect}: #{@actor.inspect}"
+            return 
+          end
           @target = !options[:target].nil? ? send(options[:target].to_sym) : nil
           @extra_fields ||= nil
-          @followers = @actor.send(options[:followers].to_sym)
+          follower_method = options[:followers].to_sym
+          @followers = @actor.respond_to?(follower_method) ? @actor.send(follower_method) : []
           @mentionable = options[:mentionable]
           add_activity activity(verb: options[:verb])
+        end
         end
       end
   end
 
   protected
+
+    def redis_proof
+      yield
+    rescue Redis::CannotConnectError => e
+      logger.error "Timeline Audit Error: Redis::CannotConnectError: #{e.inspect}"
+      true
+    end
+
+
     def activity(options={})
       {
         verb: options[:verb],
-        actor: options_for(@actor),
-        object: options_for(@object),
-        target: options_for(@target),
+        actor: options_for(@actor, options[:verb]),
+        object: options_for(@object, options[:verb]),
+        target: options_for(@target, options[:verb]),
         created_at: Time.now
       }
     end
@@ -49,13 +70,13 @@ module Timeline::Track
     def add_activity(activity_item)
       redis_add "global:activity", activity_item
       add_activity_to_user(activity_item[:actor][:id], activity_item)
-      add_activity_by_user(activity_item[:actor][:id], activity_item)
+      #add_activity_by_user(activity_item[:actor][:id], activity_item)
       add_mentions(activity_item)
       add_activity_to_followers(activity_item) if @followers.any?
     end
 
     def add_activity_by_user(user_id, activity_item)
-      redis_add "user:id:#{user_id}:posts", activity_item
+      #redis_add "user:id:#{user_id}:posts", activity_item
     end
 
     def add_activity_to_user(user_id, activity_item)
@@ -79,21 +100,17 @@ module Timeline::Track
       redis_add "user:id:#{user_id}:mentions", activity_item
     end
 
-    def extra_fields_for(object)
-      return {} unless @fields_for.has_key?(object.class.to_s.downcase.to_sym)
-      @fields_for[object.class.to_s.downcase.to_sym].inject({}) do |sum, method|
-        sum[method.to_sym] = @object.send(method.to_sym)
-        sum
-      end
+    def extra_fields_for(object,verb)
+      object.respond_to?(:timeline_fields_for) ? object.send(:timeline_fields_for, verb) : {}
     end
 
-    def options_for(target)
+    def options_for(target, verb)
       if !target.nil?
         {
           id: target.id,
           class: target.class.to_s,
           display_name: target.to_s
-        }.merge(extra_fields_for(target))
+        }.merge(extra_fields_for(target, verb))
       else
         nil
       end
